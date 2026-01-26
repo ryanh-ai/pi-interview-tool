@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-01-26
+
+### Fixed
+- Install script now copies `package.json` with `pi.extensions` declaration for auto-discovery
+
 ## [0.4.1] - 2026-01-26
 
 ### Changed
