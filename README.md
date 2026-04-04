@@ -38,7 +38,8 @@ Restart pi to load the extension.
 - **Session Status Bar**: Shows project path, git branch, and session ID for identification
 - **Image Support**: Drag & drop anywhere on question, file picker, paste image or path
 - **Path Normalization**: Handles shell-escaped paths (`\ `) and macOS screenshot filenames (narrow no-break space before AM/PM)
-- **Generate & Review Options**: Single/multi-select questions show "✦ Generate more" (appends new choices) and "↻ Review options" (validates and rewrites existing choices) buttons powered by an LLM
+- **Generate & Review Options**: Single/multi-select questions show "✦ Generate more" (appends new choices) and "↻ Review options" (reviews options and rewrites the question for clarity) buttons powered by an LLM
+- **Tool Discoverability (pi v0.59+)**: Registers a `promptSnippet` so `interview` remains eligible for inclusion in pi's default `Available tools` prompt section
 - **Themes**: Built-in default + optional light/dark + custom theme CSS
 
 ## How It Works

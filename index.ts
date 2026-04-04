@@ -246,6 +246,9 @@ const PREFERRED_GENERATE_MODELS = [
 const GENERATE_OPTIONS_SYSTEM_PROMPT =
 	"You generate interview answer options. Return only a JSON array of strings. Do not include explanations or markdown.";
 
+const REVIEW_QUESTION_SYSTEM_PROMPT =
+	"You review interview questions and answer options. Preserve intent. Return only JSON with a rewritten question string and an options array.";
+
 function formatModelRef(model: GenerateModelCandidate): string {
 	return `${model.provider}/${model.id}`;
 }
@@ -307,8 +310,8 @@ export function extractGenerateResponseText(
 	return text;
 }
 
-export function extractJSONArray(text: string): string {
-	const start = text.indexOf("[");
+function extractJSONBlock(text: string, openChar: "[" | "{", closeChar: "]" | "}"): string {
+	const start = text.indexOf(openChar);
 	if (start === -1) return text;
 
 	let depth = 0;
@@ -337,11 +340,11 @@ export function extractJSONArray(text: string): string {
 			inString = true;
 			continue;
 		}
-		if (char === "[") {
+		if (char === openChar) {
 			depth++;
 			continue;
 		}
-		if (char !== "]") {
+		if (char !== closeChar) {
 			continue;
 		}
 
@@ -354,9 +357,17 @@ export function extractJSONArray(text: string): string {
 	return text;
 }
 
-export function createGenerateContext(prompt: string) {
+export function extractJSONArray(text: string): string {
+	return extractJSONBlock(text, "[", "]");
+}
+
+function extractJSONObject(text: string): string {
+	return extractJSONBlock(text, "{", "}");
+}
+
+export function createGenerateContext(prompt: string, systemPrompt = GENERATE_OPTIONS_SYSTEM_PROMPT) {
 	return {
-		systemPrompt: GENERATE_OPTIONS_SYSTEM_PROMPT,
+		systemPrompt,
 		messages: [{
 			role: "user" as const,
 			content: [{ type: "text" as const, text: prompt }],
@@ -365,14 +376,7 @@ export function createGenerateContext(prompt: string) {
 	};
 }
 
-export function parseGeneratedOptions(text: string): string[] {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(extractJSONArray(text));
-	} catch (err) {
-		const detail = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse generated options: ${detail}`);
-	}
+function normalizeGeneratedOptions(parsed: unknown): string[] {
 	if (!Array.isArray(parsed)) {
 		throw new Error("Expected array of options");
 	}
@@ -389,7 +393,41 @@ export function parseGeneratedOptions(text: string): string[] {
 	return options;
 }
 
-function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile {
+export function parseGeneratedOptions(text: string): string[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(extractJSONArray(text));
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse generated options: ${detail}`);
+	}
+	return normalizeGeneratedOptions(parsed);
+}
+
+export function parseReviewedQuestion(text: string): { question: string; options: string[] } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(extractJSONObject(text));
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse reviewed question: ${detail}`);
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		throw new Error("Expected reviewed question object");
+	}
+
+	const review = parsed as Record<string, unknown>;
+	if (typeof review.question !== "string" || !review.question.trim()) {
+		throw new Error("Reviewed question must include a non-empty question string");
+	}
+
+	return {
+		question: review.question.trim(),
+		options: normalizeGeneratedOptions(review.options),
+	};
+}
+
+export function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile {
 	// Extract JSON from <script id="pi-interview-data">
 	const match = html.match(/<script[^>]+id=["']pi-interview-data["'][^>]*>([\s\S]*?)<\/script>/i);
 	if (!match) {
@@ -406,11 +444,13 @@ function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile 
 
 	const raw = data as Record<string, unknown>;
 	const validated = validateQuestions(data);
+	const questionTypeById = new Map(validated.questions.map((question) => [question.id, question.type]));
 
-	// Resolve relative image paths to absolute based on HTML file location
+	// Resolve relative image paths to absolute based on HTML file location.
+	// Only image-question values are treated as paths; text/single/multi values must stay literal.
 	const snapshotDir = path.dirname(filePath);
 	const savedAnswers = Array.isArray(raw.savedAnswers)
-		? resolveAnswerPaths(raw.savedAnswers as ResponseItem[], snapshotDir)
+		? resolveAnswerPaths(raw.savedAnswers as ResponseItem[], snapshotDir, questionTypeById)
 		: undefined;
 
 	// Validate savedFrom if present
@@ -436,26 +476,28 @@ function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile 
 	};
 }
 
-function resolveAnswerPaths(answers: ResponseItem[], baseDir: string): ResponseItem[] {
-	return answers.map((ans) => ({
-		...ans,
-		value: resolvePathValue(ans.value, baseDir),
-		attachments: ans.attachments?.map((p) => resolveImagePath(p, baseDir)),
-	}));
+function resolveAnswerPaths(
+	answers: ResponseItem[],
+	baseDir: string,
+	questionTypeById: Map<string, "single" | "multi" | "text" | "image" | "info">,
+): ResponseItem[] {
+	return answers.map((ans) => {
+		const questionType = questionTypeById.get(ans.id);
+		return {
+			...ans,
+			value: questionType === "image" ? resolvePathValue(ans.value, baseDir) : ans.value,
+			attachments: ans.attachments?.map((attachmentPath) => resolveImagePath(attachmentPath, baseDir)),
+		};
+	});
 }
 
 function resolveImagePath(p: string, baseDir: string): string {
 	if (!p) return p;
-	// Skip URLs
-	if (p.includes("://")) return p;
-	// Expand ~ first
+	// Skip URLs and data/file URIs
+	if (p.includes("://") || p.startsWith("data:") || p.startsWith("file:")) return p;
 	const expanded = expandHome(p);
-	// Don't resolve if already absolute (cross-platform check)
-	if (path.isAbsolute(expanded)) {
-		return expanded;
-	}
-	// Resolve relative path against snapshot directory
-	return path.join(baseDir, p);
+	if (path.isAbsolute(expanded)) return expanded;
+	return path.join(baseDir, expanded);
 }
 
 function resolvePathValue(value: string | string[], baseDir: string): string | string[] {
@@ -523,6 +565,8 @@ export default function (pi: ExtensionAPI) {
 			"Questions can have a codeBlock field to display code above options. Types: single (radio), multi (checkbox), text (textarea), image (file upload), info (non-interactive). " +
 			'Media blocks: { type: "image", src, alt, caption }, { type: "table", table: { headers, rows, highlights }, caption }, { type: "chart", chart: { type, data, options }, caption }, { type: "mermaid", mermaid: "graph LR\\n..." }, { type: "html", html }. ' +
 			"Info type is a non-interactive content panel for displaying context with media. Media position: above (default), below, side (two-column).",
+		promptSnippet:
+			"Gather structured user input through an interactive form for requirements, tradeoffs, or multi-dimensional decisions.",
 		parameters: InterviewParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -669,6 +713,21 @@ export default function (pi: ExtensionAPI) {
 						return parseGeneratedOptions(extractGenerateResponseText(modelRef, response));
 					};
 
+					const reviewQuestion = async (model: Model<Api>, prompt: string, generateSignal: AbortSignal) => {
+						const modelRef = formatModelRef(model);
+						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+						if (!auth.ok) throw new Error(`${modelRef}: ${auth.error}`);
+						if (!auth.apiKey) throw new Error(`No API key for ${modelRef}`);
+
+						const response = await complete(
+							model,
+							createGenerateContext(prompt, REVIEW_QUESTION_SYSTEM_PROMPT),
+							{ apiKey: auth.apiKey, headers: auth.headers, signal: generateSignal },
+						);
+
+						return parseReviewedQuestion(extractGenerateResponseText(modelRef, response));
+					};
+
 					onGenerate = async (questionId, existingOptions, generateSignal, mode) => {
 						const question = questionsData.questions.find((q) => q.id === questionId);
 						if (!question) throw new Error(`Unknown question: ${questionId}`);
@@ -687,18 +746,20 @@ export default function (pi: ExtensionAPI) {
 								recommended = `\nRecommended: ${value}`;
 							}
 							prompt = [
-								"Review these options for the question below. Fix any issues: incorrect options, missing obvious choices, poor wording, redundancy.",
-								"Return ONLY a JSON array of the corrected option strings. Keep good options as-is, fix bad ones, add missing ones, remove bad ones.",
+								"Review this interview question and its options.",
+								"Rewrite the question so it is easier to understand while preserving the original intent.",
+								"Review the options the same way you already would: keep good ones as-is, fix bad ones, add missing ones, and remove bad ones.",
+								"Return ONLY JSON in this format:",
+								'{"question":"Clearer question text","options":["Option A","Option B","Option C"]}',
 								"",
 								questionsData.title ? `Interview: ${questionsData.title}` : null,
+								questionsData.description ? `Interview context: ${questionsData.description}` : null,
 								`Question: ${question.question}`,
-								question.context ? `Context: ${question.context}` : null,
+								question.context ? `Question context: ${question.context}` : null,
 								recommended || null,
 								"",
 								"Current options:",
 								existingList,
-								"",
-								'Format: ["Option A", "Option B", "Option C"]',
 							].filter((line) => line !== null).join("\n");
 						} else {
 							prompt = [
@@ -713,6 +774,26 @@ export default function (pi: ExtensionAPI) {
 								"",
 								'Format: ["Option A", "Option B", "Option C"]',
 							].filter((line) => line !== null).join("\n");
+						}
+
+						if (mode === "review") {
+							let result: { question: string; options: string[] };
+							try {
+								result = await reviewQuestion(generateModel, prompt, generateSignal);
+							} catch (err) {
+								if (!fallbackGenerateModel || generateSignal.aborted) {
+									throw err;
+								}
+								try {
+									result = await reviewQuestion(fallbackGenerateModel, prompt, generateSignal);
+								} catch (fallbackErr) {
+									const primaryMessage = err instanceof Error ? err.message : String(err);
+									const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+									throw new Error(`${primaryMessage}. Fallback failed: ${fallbackMessage}`);
+								}
+							}
+
+							return result;
 						}
 
 						let options: string[];

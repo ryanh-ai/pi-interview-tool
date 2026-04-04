@@ -401,6 +401,35 @@
     return typeof option === "object" && option !== null && "label" in option;
   }
 
+  function syncRecommendations(question, options) {
+    if (!question.recommended) return;
+
+    if (question.type === "single") {
+      if (typeof question.recommended === "string" && options.includes(question.recommended)) {
+        return;
+      }
+      delete question.recommended;
+      delete question.conviction;
+      return;
+    }
+
+    if (question.type !== "multi") {
+      delete question.recommended;
+      delete question.conviction;
+      return;
+    }
+
+    const nextRecommended = (Array.isArray(question.recommended)
+      ? question.recommended
+      : [question.recommended]).filter((option) => options.includes(option));
+    if (nextRecommended.length === 0) {
+      delete question.recommended;
+      delete question.conviction;
+      return;
+    }
+    question.recommended = nextRecommended;
+  }
+
   function renderCodeBlock(block) {
     if (!block || !block.code) return null;
 
@@ -1394,6 +1423,7 @@
 
   function createGenerateMoreUI(question, list) {
     if (!data.canGenerate) return null;
+    if (question.options.some(isRichOption)) return null;
 
     const container = document.createElement("div");
     container.className = "generate-more";
@@ -1499,6 +1529,10 @@
         }
 
         if (mode === "review") {
+          if (typeof result.question !== "string" || !result.question.trim()) {
+            throw new Error("No revised question returned");
+          }
+
           const seen = new Set();
           const revisedOptions = result.options.filter((option) => {
             const key = option.toLowerCase().trim();
@@ -1508,6 +1542,14 @@
           });
           if (revisedOptions.length === 0) {
             throw new Error("No valid options returned for review");
+          }
+
+          question.question = result.question.trim();
+          question.options = revisedOptions;
+          syncRecommendations(question, revisedOptions);
+          const title = list.closest('.question-card')?.querySelector('.question-title');
+          if (title) {
+            title.innerHTML = renderLightMarkdown(question.question);
           }
 
           list
@@ -1520,7 +1562,7 @@
           if (question.type === "multi") updateDoneState(question.id);
           debounceSave();
           showStatus(
-            revisedOptions.length + " option" + (revisedOptions.length > 1 ? "s" : "") + " revised",
+            "Question updated and " + revisedOptions.length + " option" + (revisedOptions.length > 1 ? "s" : "") + " revised",
             2500,
           );
         } else {
@@ -1536,6 +1578,7 @@
           if (newOptions.length === 0) {
             showStatus("All generated options already exist", 3000);
           } else {
+            question.options = question.options.concat(newOptions);
             newOptions.forEach((optionText, i) => {
               const optionEl = createGeneratedOption(question, optionText, i);
               list.insertBefore(optionEl, container);
@@ -2578,7 +2621,8 @@
       }
     } catch (err) {
       if (!submitted) {
-        showSaveError("Failed to save interview");
+        const message = err instanceof Error ? err.message : String(err);
+        showSaveError(`Failed to save interview: ${message}`);
       }
       return false;
     }
@@ -2659,7 +2703,8 @@
       if (isNetworkError(err)) {
         showSessionExpired();
       } else {
-        showGlobalError("Failed to submit responses.");
+        const message = err instanceof Error ? err.message : String(err);
+        showGlobalError(`Failed to submit responses: ${message}`);
         submitBtn.disabled = false;
       }
     }

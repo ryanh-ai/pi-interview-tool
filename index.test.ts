@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
-import {
+import { join } from "node:path";
+import interviewExtension, {
 	createGenerateContext,
 	extractGenerateResponseText,
 	extractJSONArray,
+	loadSavedInterview,
 	parseGeneratedOptions,
+	parseReviewedQuestion,
 	selectGenerateModels,
 } from "./index.js";
 
@@ -71,6 +74,11 @@ describe("createGenerateContext", () => {
 		expect(context.systemPrompt).toContain("Return only a JSON array of strings");
 		expect(context.messages[0].content[0].text).toBe("Review these options");
 	});
+
+	it("allows review mode to supply a different system prompt", () => {
+		const context = createGenerateContext("Review this question", "Custom review prompt");
+		expect(context.systemPrompt).toBe("Custom review prompt");
+	});
 });
 
 describe("parseGeneratedOptions", () => {
@@ -80,5 +88,57 @@ describe("parseGeneratedOptions", () => {
 
 	it("preserves the parse error context", () => {
 		expect(() => parseGeneratedOptions('not json')).toThrow("Failed to parse generated options:");
+	});
+});
+
+describe("parseReviewedQuestion", () => {
+	it("parses a rewritten question and reviewed options from a JSON object", () => {
+		expect(
+			parseReviewedQuestion('{"question":"Clearer prompt","options":["A","B"]}'),
+		).toEqual({ question: "Clearer prompt", options: ["A", "B"] });
+	});
+
+	it("preserves the parse error context", () => {
+		expect(() => parseReviewedQuestion('not json')).toThrow("Failed to parse reviewed question:");
+	});
+});
+
+describe("loadSavedInterview", () => {
+	it("resolves only image and attachment paths while keeping literal answers unchanged", () => {
+		const html = `<!doctype html><html><body>
+		<script type="application/json" id="pi-interview-data">${JSON.stringify({
+			title: "Saved",
+			questions: [
+				{ id: "framework", type: "single", question: "Framework?", options: ["React", "Vue"] },
+				{ id: "notes", type: "text", question: "Notes?" },
+				{ id: "mockup", type: "image", question: "Mockup" },
+			],
+			savedAnswers: [
+				{ id: "framework", value: "React", attachments: ["images/decision.png"] },
+				{ id: "notes", value: "Use edge runtime" },
+				{ id: "mockup", value: "images/mock.png" },
+			],
+		})}</script>
+		</body></html>`;
+
+		const snapshotPath = "/tmp/pi-interview-snapshot/index.html";
+		const loaded = loadSavedInterview(html, snapshotPath);
+		const answers = loaded.savedAnswers ?? [];
+
+		expect(answers[0]?.value).toBe("React");
+		expect(answers[0]?.attachments).toEqual([join("/tmp/pi-interview-snapshot", "images/decision.png")]);
+		expect(answers[1]?.value).toBe("Use edge runtime");
+		expect(answers[2]?.value).toBe(join("/tmp/pi-interview-snapshot", "images/mock.png"));
+	});
+});
+
+describe("tool registration", () => {
+	it("registers a promptSnippet so the tool appears in default tool prompts", () => {
+		let registeredTool: Record<string, unknown> | undefined;
+		interviewExtension({ registerTool: (tool: Record<string, unknown>) => { registeredTool = tool; } } as unknown as Parameters<typeof interviewExtension>[0]);
+
+		expect(registeredTool).toBeDefined();
+		expect(typeof registeredTool?.promptSnippet).toBe("string");
+		expect((registeredTool?.promptSnippet as string).length).toBeGreaterThan(0);
 	});
 });

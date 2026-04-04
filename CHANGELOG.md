@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-04
+
+### Fixed
+- **Tool discoverability with pi v0.59+**: Added `promptSnippet` to the `interview` tool registration so it remains eligible for inclusion in pi's default `Available tools` system prompt.
+- **Review options question rewrite**: `Review options` now also rewrites the question text for clarity while keeping the existing option-review behavior.
+- **Generated/reviewed question persistence**: Generated options and reviewed question rewrites now persist in the server-side interview state, so saves, recovery, and reopened snapshots stay in sync with what the user saw in the form.
+- **Review-mode recommendation cleanup**: When reviewed options remove or rename previously recommended answers, `recommended` and `conviction` are now cleared or narrowed so saved interviews do not fail validation on reload.
+- **Rich option safety**: Generate/review actions are now disabled for questions that use rich object options with code previews, preventing review mode from flattening them into plain strings.
+- **Saved interview answer integrity**: Reloading saved interview HTML now resolves paths only for image answers and attachments. Text, single-select, and multi-select answers remain literal so forms pre-populate correctly.
+- **Submit/save error clarity**: Client-side save/submit failures now include the original error message instead of collapsing to generic text.
+
 ## [0.6.0] - 2026-03-30
 
 ### Added

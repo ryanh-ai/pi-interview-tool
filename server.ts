@@ -207,7 +207,7 @@ export interface InterviewServerCallbacks {
 		existingOptions: string[],
 		signal: AbortSignal,
 		mode: "add" | "review",
-	) => Promise<{ options: string[] }>;
+	) => Promise<{ options: string[]; question?: string }>;
 }
 
 export interface InterviewServerHandle {
@@ -385,6 +385,35 @@ function ensureQuestionId(
 		return { ok: false, error: `Unknown question id: ${id}` };
 	}
 	return { ok: true, question };
+}
+
+function syncRecommendations(question: Question, options: string[]): void {
+	if (!question.recommended) return;
+
+	if (question.type === "single") {
+		if (typeof question.recommended === "string" && options.includes(question.recommended)) {
+			return;
+		}
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+
+	if (question.type !== "multi") {
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+
+	const nextRecommended = (Array.isArray(question.recommended)
+		? question.recommended
+		: [question.recommended]).filter((option) => options.includes(option));
+	if (nextRecommended.length === 0) {
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+	question.recommended = nextRecommended;
 }
 
 // HTML generation for saved interviews
@@ -1258,9 +1287,7 @@ export async function startInterviewServer(
 				}
 
 				// Copy local media images to snapshot and rewrite paths
-				const rewrittenQuestions = await copyMediaImages(
-					questions.questions, imagesPath, cwd
-				);
+				const rewrittenQuestions = await copyMediaImages(questions.questions, imagesPath, cwd);
 				const snapshotQuestions: QuestionsFile = {
 					...questions,
 					questions: rewrittenQuestions,
@@ -1321,6 +1348,10 @@ export async function startInterviewServer(
 					sendJson(res, 400, { ok: false, error: "Invalid question for generation" });
 					return;
 				}
+				if (question.options.some((option) => typeof option !== "string")) {
+					sendJson(res, 400, { ok: false, error: "Generation is not available for rich options" });
+					return;
+				}
 
 				const existingOptions = Array.isArray(payload.existingOptions)
 					? payload.existingOptions.filter((o): o is string => typeof o === "string")
@@ -1341,7 +1372,35 @@ export async function startInterviewServer(
 						controller.signal,
 						mode,
 					);
-					sendJson(res, 200, { ok: true, options: result.options });
+
+					const uniqueOptions: string[] = [];
+					const seenOptions = new Set<string>();
+					for (const option of result.options) {
+						const trimmed = option.trim();
+						if (!trimmed) continue;
+						const key = trimmed.toLowerCase();
+						if (seenOptions.has(key)) continue;
+						seenOptions.add(key);
+						uniqueOptions.push(trimmed);
+					}
+
+					const reviewedQuestion = typeof result.question === "string" ? result.question.trim() : undefined;
+					const storedQuestion = questions.questions.find((q) => q.id === payload.questionId);
+					if (storedQuestion) {
+						if (mode === "review" && reviewedQuestion && uniqueOptions.length > 0) {
+							storedQuestion.question = reviewedQuestion;
+							storedQuestion.options = uniqueOptions;
+							syncRecommendations(storedQuestion, uniqueOptions);
+						} else if (mode === "add") {
+							const existingKeys = new Set(existingOptions.map((option) => option.trim().toLowerCase()));
+							const newOptions = uniqueOptions.filter((option) => !existingKeys.has(option.toLowerCase()));
+							if (newOptions.length > 0) {
+								storedQuestion.options = storedQuestion.options.concat(newOptions);
+							}
+						}
+					}
+
+					sendJson(res, 200, { ok: true, options: uniqueOptions, question: reviewedQuestion });
 				} catch (err) {
 					if (controller.signal.aborted) {
 						sendJson(res, 409, { ok: false, error: "Request cancelled" });

@@ -1391,7 +1391,7 @@ button {
 .code-block pre {
   margin: 0;
   padding: 0.75rem;
-  overflow-x: auto;
+  overflow-x: hidden;
   line-height: 1.5;
 }
 
@@ -1404,7 +1404,8 @@ button {
 
 .code-block-lines-container {
   display: table;
-  min-width: 100%;
+  width: 100%;
+  table-layout: fixed;
 }
 
 .code-block-line {
@@ -1425,7 +1426,8 @@ button {
 
 .code-block-line-content {
   display: table-cell;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   padding-right: 0.75rem;
 }
 
