@@ -196,11 +196,18 @@ export interface InterviewServerOptions {
 	snapshotDir?: string;
 	autoSaveOnSubmit?: boolean;
 	savedAnswers?: ResponseItem[];
+	canGenerate?: boolean;
 }
 
 export interface InterviewServerCallbacks {
 	onSubmit: (responses: ResponseItem[]) => void;
 	onCancel: (reason?: "timeout" | "user" | "stale", partialResponses?: ResponseItem[]) => void;
+	onGenerate?: (
+		questionId: string,
+		existingOptions: string[],
+		signal: AbortSignal,
+		mode: "add" | "review",
+	) => Promise<{ options: string[]; question?: string }>;
 }
 
 export interface InterviewServerHandle {
@@ -303,8 +310,9 @@ async function parseJSONBody(req: IncomingMessage): Promise<unknown> {
 		req.on("end", () => {
 			try {
 				resolve(JSON.parse(body));
-			} catch {
-				reject(new Error("Invalid JSON"));
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				reject(new Error(`Invalid JSON: ${message}`));
 			}
 		});
 
@@ -377,6 +385,35 @@ function ensureQuestionId(
 		return { ok: false, error: `Unknown question id: ${id}` };
 	}
 	return { ok: true, question };
+}
+
+function syncRecommendations(question: Question, options: string[]): void {
+	if (!question.recommended) return;
+
+	if (question.type === "single") {
+		if (typeof question.recommended === "string" && options.includes(question.recommended)) {
+			return;
+		}
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+
+	if (question.type !== "multi") {
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+
+	const nextRecommended = (Array.isArray(question.recommended)
+		? question.recommended
+		: [question.recommended]).filter((option) => options.includes(option));
+	if (nextRecommended.length === 0) {
+		delete question.recommended;
+		delete question.conviction;
+		return;
+	}
+	question.recommended = nextRecommended;
 }
 
 // HTML generation for saved interviews
@@ -807,6 +844,7 @@ export async function startInterviewServer(
 	let browserConnected = false;
 	let lastHeartbeatAt = Date.now();
 	let watchdog: NodeJS.Timeout | null = null;
+	let sessionKeepAlive: NodeJS.Timeout | null = null;
 	let completed = false;
 
 	const stopWatchdog = () => {
@@ -816,10 +854,18 @@ export async function startInterviewServer(
 		}
 	};
 
+	const stopSessionKeepAlive = () => {
+		if (sessionKeepAlive) {
+			clearInterval(sessionKeepAlive);
+			sessionKeepAlive = null;
+		}
+	};
+
 	const markCompleted = () => {
 		if (completed) return false;
 		completed = true;
 		stopWatchdog();
+		stopSessionKeepAlive();
 		return true;
 	};
 
@@ -838,6 +884,20 @@ export async function startInterviewServer(
 			const method = req.method || "GET";
 			const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
 			log(verbose, `${method} ${url.pathname}`);
+
+			const parseBodyOrRespond = async (): Promise<unknown | null> => {
+				try {
+					return await parseJSONBody(req);
+				} catch (err) {
+					if (err instanceof BodyTooLargeError) {
+						sendJson(res, err.statusCode, { ok: false, error: err.message });
+						return null;
+					}
+					const message = err instanceof Error ? err.message : String(err);
+					sendJson(res, 400, { ok: false, error: message });
+					return null;
+				}
+			};
 
 			if (method === "GET" && url.pathname === "/") {
 				if (!validateTokenQuery(url, sessionToken, res)) return;
@@ -858,6 +918,7 @@ export async function startInterviewServer(
 					},
 					savedAnswers: options.savedAnswers,
 					autoSaveOnSubmit: options.autoSaveOnSubmit ?? true,
+					canGenerate: options.canGenerate ?? false,
 				});
 				const html = TEMPLATE
 					.replace("<!-- __CDN_SCRIPTS__ -->", cdnScripts)
@@ -978,11 +1039,8 @@ export async function startInterviewServer(
 			}
 
 			if (method === "POST" && url.pathname === "/heartbeat") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) {
-					sendJson(res, 400, { ok: false, error: "Invalid body" });
-					return;
-				}
+				const body = await parseBodyOrRespond();
+				if (!body) return;
 				if (!validateTokenBody(body, sessionToken, res)) return;
 				touchHeartbeat();
 				sendJson(res, 200, { ok: true });
@@ -990,14 +1048,7 @@ export async function startInterviewServer(
 			}
 
 			if (method === "POST" && url.pathname === "/cancel") {
-				const body = await parseJSONBody(req).catch((err) => {
-					if (err instanceof BodyTooLargeError) {
-						sendJson(res, err.statusCode, { ok: false, error: err.message });
-						return null;
-					}
-					sendJson(res, 400, { ok: false, error: err.message });
-					return null;
-				});
+				const body = await parseBodyOrRespond();
 				if (!body) return;
 				if (!validateTokenBody(body, sessionToken, res)) return;
 				if (completed) {
@@ -1020,14 +1071,7 @@ export async function startInterviewServer(
 			}
 
 			if (method === "POST" && url.pathname === "/submit") {
-				const body = await parseJSONBody(req).catch((err) => {
-					if (err instanceof BodyTooLargeError) {
-						sendJson(res, err.statusCode, { ok: false, error: err.message });
-						return null;
-					}
-					sendJson(res, 400, { ok: false, error: err.message });
-					return null;
-				});
+				const body = await parseBodyOrRespond();
 				if (!body) return;
 				if (!validateTokenBody(body, sessionToken, res)) return;
 				if (completed) {
@@ -1143,20 +1187,22 @@ export async function startInterviewServer(
 
 				markCompleted();
 				unregisterSession(sessionId);
-				sendJson(res, 200, { ok: true });
+				const nextSession = getActiveSessions()
+					.filter((s) => s.id !== sessionId)
+					.sort((a, b) => {
+						if (a.startedAt !== b.startedAt) {
+							return a.startedAt - b.startedAt;
+						}
+						return a.id.localeCompare(b.id);
+					})[0];
+				const nextUrl = nextSession ? nextSession.url : null;
+				sendJson(res, 200, { ok: true, nextUrl });
 				setImmediate(() => callbacks.onSubmit(responses));
 				return;
 			}
 
 			if (method === "POST" && url.pathname === "/save") {
-				const body = await parseJSONBody(req).catch((err) => {
-					if (err instanceof BodyTooLargeError) {
-						sendJson(res, err.statusCode, { ok: false, error: err.message });
-						return null;
-					}
-					sendJson(res, 400, { ok: false, error: err.message });
-					return null;
-				});
+				const body = await parseBodyOrRespond();
 				if (!body) return;
 				if (!validateTokenBody(body, sessionToken, res)) return;
 				// Note: don't check `completed` - allow save after submit
@@ -1241,9 +1287,7 @@ export async function startInterviewServer(
 				}
 
 				// Copy local media images to snapshot and rewrite paths
-				const rewrittenQuestions = await copyMediaImages(
-					questions.questions, imagesPath, cwd
-				);
+				const rewrittenQuestions = await copyMediaImages(questions.questions, imagesPath, cwd);
 				const snapshotQuestions: QuestionsFile = {
 					...questions,
 					questions: rewrittenQuestions,
@@ -1271,6 +1315,100 @@ export async function startInterviewServer(
 					path: snapshotPath,
 					relativePath: normalizePath(snapshotPath),
 				});
+				return;
+			}
+
+			if (method === "POST" && url.pathname === "/generate") {
+				const body = await parseBodyOrRespond();
+				if (!body) return;
+				if (!validateTokenBody(body, sessionToken, res)) return;
+				if (completed) {
+					sendJson(res, 409, { ok: false, error: "Session closed" });
+					return;
+				}
+
+				if (!callbacks.onGenerate) {
+					sendJson(res, 501, { ok: false, error: "Generation not available" });
+					return;
+				}
+
+				const payload = body as {
+					questionId?: string;
+					existingOptions?: string[];
+					mode?: string;
+				};
+
+				if (typeof payload.questionId !== "string") {
+					sendJson(res, 400, { ok: false, error: "Missing questionId" });
+					return;
+				}
+
+				const question = questionById.get(payload.questionId);
+				if (!question || (question.type !== "single" && question.type !== "multi")) {
+					sendJson(res, 400, { ok: false, error: "Invalid question for generation" });
+					return;
+				}
+				if (question.options.some((option) => typeof option !== "string")) {
+					sendJson(res, 400, { ok: false, error: "Generation is not available for rich options" });
+					return;
+				}
+
+				const existingOptions = Array.isArray(payload.existingOptions)
+					? payload.existingOptions.filter((o): o is string => typeof o === "string")
+					: [];
+
+				const mode = payload.mode === "review" ? "review" : "add";
+
+				const controller = new AbortController();
+				res.on("close", () => {
+					if (!res.writableEnded) controller.abort();
+				});
+				touchHeartbeat();
+
+				try {
+					const result = await callbacks.onGenerate(
+						payload.questionId,
+						existingOptions,
+						controller.signal,
+						mode,
+					);
+
+					const uniqueOptions: string[] = [];
+					const seenOptions = new Set<string>();
+					for (const option of result.options) {
+						const trimmed = option.trim();
+						if (!trimmed) continue;
+						const key = trimmed.toLowerCase();
+						if (seenOptions.has(key)) continue;
+						seenOptions.add(key);
+						uniqueOptions.push(trimmed);
+					}
+
+					const reviewedQuestion = typeof result.question === "string" ? result.question.trim() : undefined;
+					const storedQuestion = questions.questions.find((q) => q.id === payload.questionId);
+					if (storedQuestion) {
+						if (mode === "review" && reviewedQuestion && uniqueOptions.length > 0) {
+							storedQuestion.question = reviewedQuestion;
+							storedQuestion.options = uniqueOptions;
+							syncRecommendations(storedQuestion, uniqueOptions);
+						} else if (mode === "add") {
+							const existingKeys = new Set(existingOptions.map((option) => option.trim().toLowerCase()));
+							const newOptions = uniqueOptions.filter((option) => !existingKeys.has(option.toLowerCase()));
+							if (newOptions.length > 0) {
+								storedQuestion.options = storedQuestion.options.concat(newOptions);
+							}
+						}
+					}
+
+					sendJson(res, 200, { ok: true, options: uniqueOptions, question: reviewedQuestion });
+				} catch (err) {
+					if (controller.signal.aborted) {
+						sendJson(res, 409, { ok: false, error: "Request cancelled" });
+						return;
+					}
+					const message = err instanceof Error ? err.message : "Generation failed";
+					sendJson(res, 500, { ok: false, error: message });
+				}
 				return;
 			}
 
@@ -1307,6 +1445,11 @@ export async function startInterviewServer(
 				lastSeen: now,
 			};
 			registerSession(sessionEntry);
+			const keepAliveEntry = sessionEntry;
+			sessionKeepAlive = setInterval(() => {
+				if (completed) return;
+				touchSession(keepAliveEntry);
+			}, 10000);
 			if (!watchdog) {
 				watchdog = setInterval(() => {
 					if (completed || !browserConnected) return;
