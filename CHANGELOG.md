@@ -2,9 +2,38 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-04
+
+### Fixed
+- **Tool discoverability with pi v0.59+**: Added `promptSnippet` to the `interview` tool registration so it remains eligible for inclusion in pi's default `Available tools` system prompt.
+- **Review options question rewrite**: `Review options` now also rewrites the question text for clarity while keeping the existing option-review behavior.
+- **Generated/reviewed question persistence**: Generated options and reviewed question rewrites now persist in the server-side interview state, so saves, recovery, and reopened snapshots stay in sync with what the user saw in the form.
+- **Review-mode recommendation cleanup**: When reviewed options remove or rename previously recommended answers, `recommended` and `conviction` are now cleared or narrowed so saved interviews do not fail validation on reload.
+- **Rich option safety**: Generate/review actions are now disabled for questions that use rich object options with code previews, preventing review mode from flattening them into plain strings.
+- **Saved interview answer integrity**: Reloading saved interview HTML now resolves paths only for image answers and attachments. Text, single-select, and multi-select answers remain literal so forms pre-populate correctly.
+- **Submit/save error clarity**: Client-side save/submit failures now include the original error message instead of collapsing to generic text.
+
+## [0.6.0] - 2026-03-30
+
+### Added
+- **Generate & review options**: Single and multi-select questions show two LLM-powered buttons: "✦ Generate more" appends new deduplicated choices, and "↻ Review options" validates and rewrites the existing options. Default model is the agent's current model, configurable via `generateModel` in interview settings.
+
+### Fixed
+- **Generate model fallback**: When an explicitly configured `generateModel` fails at request time, interview now surfaces the provider error and retries once with the current session model when it differs.
+- **Codex-compatible generation requests**: Generate/review requests now include a system prompt, so fallback to `openai-codex` session models works instead of failing with `{"detail":"Instructions are required"}`.
+
+## [0.5.5] - 2026-03-21
+
 ### Added
 - **Native macOS rendering**: When `glimpseui` is installed separately (`pi install npm:glimpseui`), interviews open in a native WKWebView window instead of a browser tab. Window lifecycle (submit, cancel, timeout) and queue toast session switching work correctly in the native environment. Falls back to browser on other platforms or when Glimpse is not detected.
 - **Inline JSON**: Pass questions as a JSON string directly to the `questions` parameter instead of writing a temp file.
+
+### Fixed
+- **Queued interview handoff**: When submitting an interview with queued sessions waiting, the Glimpse/browser window now redirects to the next queued interview instead of closing. The submit response includes the oldest queued session's URL, and the client navigates to it directly.
+- **Queue ordering stability**: Next-session handoff now uses a deterministic tie-breaker (`startedAt`, then `session id`) so simultaneous starts cannot produce ambiguous promotion order.
+- **Settings parse failures are now visible**: Invalid `~/.pi/agent/settings.json` JSON no longer silently falls back to defaults; the tool now throws with parse context so config errors are debuggable.
+- **Submit response parsing**: Client submit flow now preserves JSON parse failures from `/submit` instead of replacing them with a generic fallback object.
+- **Queued session staleness**: Queued interview sessions now stay alive in the sessions registry via a server-side keep-alive interval, so queued sessions without browser heartbeats no longer go stale.
 
 ## [0.5.4] - 2026-03-16
 

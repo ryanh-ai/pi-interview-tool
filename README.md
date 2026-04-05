@@ -38,6 +38,8 @@ Restart pi to load the extension.
 - **Session Status Bar**: Shows project path, git branch, and session ID for identification
 - **Image Support**: Drag & drop anywhere on question, file picker, paste image or path
 - **Path Normalization**: Handles shell-escaped paths (`\ `) and macOS screenshot filenames (narrow no-break space before AM/PM)
+- **Generate & Review Options**: Single/multi-select questions show "✦ Generate more" (appends new choices) and "↻ Review options" (reviews options and rewrites the question for clarity) buttons powered by an LLM
+- **Tool Discoverability (pi v0.59+)**: Registers a `promptSnippet` so `interview` remains eligible for inclusion in pi's default `Available tools` prompt section
 - **Themes**: Built-in default + optional light/dark + custom theme CSS
 
 ## How It Works
@@ -63,7 +65,7 @@ Restart pi to load the extension.
 
 **Timeout behavior:** The countdown (visible in corner) resets on any activity - typing, clicking, or mouse movement. When it expires, an overlay appears giving the user a chance to continue. Progress is never lost thanks to localStorage auto-save.
 
-**Multi-agent behavior:** When multiple agents run interviews simultaneously, only the first auto-opens the window. Subsequent interviews are queued and shown as a URL in the tool output, preventing focus stealing. Active interviews also surface a top-right toast with a dropdown to open queued sessions. A session status bar at the top of each form shows the project path, git branch, and session ID for easy identification.
+**Multi-agent behavior:** When multiple agents run interviews simultaneously, only the first auto-opens the window. Subsequent interviews are queued and shown as a URL in the tool output, preventing focus stealing. When you submit the active interview, the window automatically redirects to the next queued interview. Active interviews also surface a top-right toast with a dropdown to open queued sessions. A session status bar at the top of each form shows the project path, git branch, and session ID for easy identification.
 
 ## Usage
 
@@ -287,6 +289,7 @@ Settings in `~/.pi/agent/settings.json`:
     "port": 19847,
     "snapshotDir": "~/.pi/interview-snapshots/",
     "autoSaveOnSubmit": true,
+    "generateModel": "anthropic/claude-haiku-4-5",
     "theme": {
       "mode": "auto",
       "name": "default",
@@ -305,6 +308,8 @@ Settings in `~/.pi/agent/settings.json`:
 - `autoSaveOnSubmit`: Automatically save snapshot on successful submit (default: `true`)
 
 **Port setting**: Set a fixed `port` (e.g., `19847`) to use a consistent port across sessions.
+
+**Generate model**: `generateModel` sets the model for the generate/review option actions (e.g., `"anthropic/claude-haiku-4-5"`). Defaults to the agent's current model, then falls back to a cheap available model. If an explicitly configured generate model fails at request time and the current session is using a different model, interview retries once with the current session model.
 
 **Theme notes:**
 - `mode`: `dark` (default), `light`, or `auto` (follows OS unless overridden)

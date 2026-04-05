@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { StringEnum, complete, type Api, type AssistantMessage, type Model } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import * as path from "node:path";
@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { execSync, execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { startInterviewServer, getActiveSessions, type ResponseItem } from "./server.js";
+import { startInterviewServer, getActiveSessions, type ResponseItem, type InterviewServerCallbacks } from "./server.js";
 import { validateQuestions, sanitizeLLMJSON, type QuestionsFile } from "./schema.js";
 import { loadSettings, type InterviewThemeSettings } from "./settings.js";
 
@@ -232,7 +232,202 @@ function loadQuestions(questionsInput: string, cwd: string): SavedQuestionsFile 
 	return validateQuestions(data);
 }
 
-function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile {
+interface GenerateModelCandidate {
+	provider: string;
+	id: string;
+}
+
+const PREFERRED_GENERATE_MODELS = [
+	"anthropic/claude-haiku-4-5",
+	"google/gemini-2.5-flash",
+	"openai/gpt-4.1-mini",
+];
+
+const GENERATE_OPTIONS_SYSTEM_PROMPT =
+	"You generate interview answer options. Return only a JSON array of strings. Do not include explanations or markdown.";
+
+const REVIEW_QUESTION_SYSTEM_PROMPT =
+	"You review interview questions and answer options. Preserve intent. Return only JSON with a rewritten question string and an options array.";
+
+function formatModelRef(model: GenerateModelCandidate): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function findModelByRef<T extends GenerateModelCandidate>(models: T[], modelRef: string): T | null {
+	for (const model of models) {
+		if (formatModelRef(model) === modelRef) {
+			return model;
+		}
+	}
+	return null;
+}
+
+export function selectGenerateModels<T extends GenerateModelCandidate>(
+	configuredModel: T | null,
+	currentModel: T | null,
+	availableModels: T[],
+): { primary: T | null; fallback: T | null } {
+	if (configuredModel) {
+		if (!currentModel || formatModelRef(currentModel) === formatModelRef(configuredModel)) {
+			return { primary: configuredModel, fallback: null };
+		}
+		return { primary: configuredModel, fallback: currentModel };
+	}
+
+	if (currentModel) {
+		return { primary: currentModel, fallback: null };
+	}
+
+	for (const modelRef of PREFERRED_GENERATE_MODELS) {
+		const preferredModel = findModelByRef(availableModels, modelRef);
+		if (preferredModel) {
+			return { primary: preferredModel, fallback: null };
+		}
+	}
+
+	return { primary: availableModels[0] ?? null, fallback: null };
+}
+
+export function extractGenerateResponseText(
+	modelRef: string,
+	response: Pick<AssistantMessage, "content" | "stopReason" | "errorMessage">,
+): string {
+	if (response.stopReason === "aborted") {
+		throw new Error("Aborted");
+	}
+	if (response.stopReason === "error") {
+		throw new Error(response.errorMessage ? `${modelRef}: ${response.errorMessage}` : `${modelRef} failed`);
+	}
+
+	const text = response.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("")
+		.trim();
+	if (!text) {
+		throw new Error(`${modelRef} returned no text response`);
+	}
+	return text;
+}
+
+function extractJSONBlock(text: string, openChar: "[" | "{", closeChar: "]" | "}"): string {
+	const start = text.indexOf(openChar);
+	if (start === -1) return text;
+
+	let depth = 0;
+	let inString = false;
+	let escaping = false;
+
+	for (let i = start; i < text.length; i++) {
+		const char = text[i];
+
+		if (inString) {
+			if (escaping) {
+				escaping = false;
+				continue;
+			}
+			if (char === "\\") {
+				escaping = true;
+				continue;
+			}
+			if (char === '"') {
+				inString = false;
+			}
+			continue;
+		}
+
+		if (char === '"') {
+			inString = true;
+			continue;
+		}
+		if (char === openChar) {
+			depth++;
+			continue;
+		}
+		if (char !== closeChar) {
+			continue;
+		}
+
+		depth--;
+		if (depth === 0) {
+			return text.slice(start, i + 1);
+		}
+	}
+
+	return text;
+}
+
+export function extractJSONArray(text: string): string {
+	return extractJSONBlock(text, "[", "]");
+}
+
+function extractJSONObject(text: string): string {
+	return extractJSONBlock(text, "{", "}");
+}
+
+export function createGenerateContext(prompt: string, systemPrompt = GENERATE_OPTIONS_SYSTEM_PROMPT) {
+	return {
+		systemPrompt,
+		messages: [{
+			role: "user" as const,
+			content: [{ type: "text" as const, text: prompt }],
+			timestamp: Date.now(),
+		}],
+	};
+}
+
+function normalizeGeneratedOptions(parsed: unknown): string[] {
+	if (!Array.isArray(parsed)) {
+		throw new Error("Expected array of options");
+	}
+
+	const options = parsed
+		.filter(
+			(item: unknown): item is string =>
+				typeof item === "string" && item.trim().length > 0,
+		)
+		.map((option: string) => option.trim());
+	if (options.length === 0) {
+		throw new Error("No valid options generated");
+	}
+	return options;
+}
+
+export function parseGeneratedOptions(text: string): string[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(extractJSONArray(text));
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse generated options: ${detail}`);
+	}
+	return normalizeGeneratedOptions(parsed);
+}
+
+export function parseReviewedQuestion(text: string): { question: string; options: string[] } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(extractJSONObject(text));
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse reviewed question: ${detail}`);
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		throw new Error("Expected reviewed question object");
+	}
+
+	const review = parsed as Record<string, unknown>;
+	if (typeof review.question !== "string" || !review.question.trim()) {
+		throw new Error("Reviewed question must include a non-empty question string");
+	}
+
+	return {
+		question: review.question.trim(),
+		options: normalizeGeneratedOptions(review.options),
+	};
+}
+
+export function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile {
 	// Extract JSON from <script id="pi-interview-data">
 	const match = html.match(/<script[^>]+id=["']pi-interview-data["'][^>]*>([\s\S]*?)<\/script>/i);
 	if (!match) {
@@ -242,17 +437,20 @@ function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile 
 	let data: unknown;
 	try {
 		data = JSON.parse(match[1]);
-	} catch {
-		throw new Error("Invalid saved interview: malformed JSON");
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Invalid saved interview: malformed JSON (${message})`);
 	}
 
 	const raw = data as Record<string, unknown>;
 	const validated = validateQuestions(data);
+	const questionTypeById = new Map(validated.questions.map((question) => [question.id, question.type]));
 
-	// Resolve relative image paths to absolute based on HTML file location
+	// Resolve relative image paths to absolute based on HTML file location.
+	// Only image-question values are treated as paths; text/single/multi values must stay literal.
 	const snapshotDir = path.dirname(filePath);
 	const savedAnswers = Array.isArray(raw.savedAnswers)
-		? resolveAnswerPaths(raw.savedAnswers as ResponseItem[], snapshotDir)
+		? resolveAnswerPaths(raw.savedAnswers as ResponseItem[], snapshotDir, questionTypeById)
 		: undefined;
 
 	// Validate savedFrom if present
@@ -278,26 +476,28 @@ function loadSavedInterview(html: string, filePath: string): SavedQuestionsFile 
 	};
 }
 
-function resolveAnswerPaths(answers: ResponseItem[], baseDir: string): ResponseItem[] {
-	return answers.map((ans) => ({
-		...ans,
-		value: resolvePathValue(ans.value, baseDir),
-		attachments: ans.attachments?.map((p) => resolveImagePath(p, baseDir)),
-	}));
+function resolveAnswerPaths(
+	answers: ResponseItem[],
+	baseDir: string,
+	questionTypeById: Map<string, "single" | "multi" | "text" | "image" | "info">,
+): ResponseItem[] {
+	return answers.map((ans) => {
+		const questionType = questionTypeById.get(ans.id);
+		return {
+			...ans,
+			value: questionType === "image" ? resolvePathValue(ans.value, baseDir) : ans.value,
+			attachments: ans.attachments?.map((attachmentPath) => resolveImagePath(attachmentPath, baseDir)),
+		};
+	});
 }
 
 function resolveImagePath(p: string, baseDir: string): string {
 	if (!p) return p;
-	// Skip URLs
-	if (p.includes("://")) return p;
-	// Expand ~ first
+	// Skip URLs and data/file URIs
+	if (p.includes("://") || p.startsWith("data:") || p.startsWith("file:")) return p;
 	const expanded = expandHome(p);
-	// Don't resolve if already absolute (cross-platform check)
-	if (path.isAbsolute(expanded)) {
-		return expanded;
-	}
-	// Resolve relative path against snapshot directory
-	return path.join(baseDir, p);
+	if (path.isAbsolute(expanded)) return expanded;
+	return path.join(baseDir, expanded);
 }
 
 function resolvePathValue(value: string | string[], baseDir: string): string | string[] {
@@ -365,6 +565,8 @@ export default function (pi: ExtensionAPI) {
 			"Questions can have a codeBlock field to display code above options. Types: single (radio), multi (checkbox), text (textarea), image (file upload), info (non-interactive). " +
 			'Media blocks: { type: "image", src, alt, caption }, { type: "table", table: { headers, rows, highlights }, caption }, { type: "chart", chart: { type, data, options }, caption }, { type: "mermaid", mermaid: "graph LR\\n..." }, { type: "html", html }. ' +
 			"Info type is a non-interactive content panel for displaying context with media. Media position: above (default), below, side (two-column).",
+		promptSnippet:
+			"Gather structured user input through an interactive form for requirements, tradeoffs, or multi-dimensional decisions.",
 		parameters: InterviewParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -394,6 +596,32 @@ export default function (pi: ExtensionAPI) {
 			const themeConfig = mergeThemeConfig(settings.theme, theme, ctx.cwd);
 			const questionsData = loadQuestions(questions, ctx.cwd);
 
+			let configuredGenerateModel: Model<Api> | null = null;
+			if (settings.generateModel) {
+				const slashIdx = settings.generateModel.indexOf("/");
+				if (slashIdx > 0) {
+					configuredGenerateModel = ctx.modelRegistry.find(
+						settings.generateModel.slice(0, slashIdx),
+						settings.generateModel.slice(slashIdx + 1),
+					);
+				}
+			}
+
+			let availableGenerateModels: Model<Api>[] = [];
+			if (!configuredGenerateModel && !ctx.model) {
+				try {
+					availableGenerateModels = ctx.modelRegistry.getAvailable();
+				} catch {
+					// Leave generation disabled when model discovery is unavailable.
+				}
+			}
+
+			const { primary: generateModel, fallback: fallbackGenerateModel } = selectGenerateModels(
+				configuredGenerateModel,
+				ctx.model ?? null,
+				availableGenerateModels,
+			);
+
 			// Expand ~ in snapshotDir if present
 			const snapshotDir = settings.snapshotDir
 				? expandHome(settings.snapshotDir)
@@ -412,7 +640,6 @@ export default function (pi: ExtensionAPI) {
 			let glimpseWin: GlimpseWindow | null = null;
 			let resolved = false;
 			let url = "";
-
 			const cleanup = () => {
 				if (server) {
 					server.close();
@@ -469,6 +696,126 @@ export default function (pi: ExtensionAPI) {
 				};
 				signal?.addEventListener("abort", handleAbort, { once: true });
 
+				let onGenerate: InterviewServerCallbacks["onGenerate"];
+				if (generateModel) {
+					const generateOptions = async (model: Model<Api>, prompt: string, generateSignal: AbortSignal) => {
+						const modelRef = formatModelRef(model);
+						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+						if (!auth.ok) throw new Error(`${modelRef}: ${auth.error}`);
+						if (!auth.apiKey) throw new Error(`No API key for ${modelRef}`);
+
+						const response = await complete(
+							model,
+							createGenerateContext(prompt),
+							{ apiKey: auth.apiKey, headers: auth.headers, signal: generateSignal },
+						);
+
+						return parseGeneratedOptions(extractGenerateResponseText(modelRef, response));
+					};
+
+					const reviewQuestion = async (model: Model<Api>, prompt: string, generateSignal: AbortSignal) => {
+						const modelRef = formatModelRef(model);
+						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+						if (!auth.ok) throw new Error(`${modelRef}: ${auth.error}`);
+						if (!auth.apiKey) throw new Error(`No API key for ${modelRef}`);
+
+						const response = await complete(
+							model,
+							createGenerateContext(prompt, REVIEW_QUESTION_SYSTEM_PROMPT),
+							{ apiKey: auth.apiKey, headers: auth.headers, signal: generateSignal },
+						);
+
+						return parseReviewedQuestion(extractGenerateResponseText(modelRef, response));
+					};
+
+					onGenerate = async (questionId, existingOptions, generateSignal, mode) => {
+						const question = questionsData.questions.find((q) => q.id === questionId);
+						if (!question) throw new Error(`Unknown question: ${questionId}`);
+
+						const existingList = existingOptions.length > 0
+							? existingOptions.map((option) => `- ${option}`).join("\n")
+							: "(none)";
+
+						let prompt: string;
+						if (mode === "review") {
+							let recommended = "";
+							if (question.recommended) {
+								const value = Array.isArray(question.recommended)
+									? question.recommended.join(", ")
+									: question.recommended;
+								recommended = `\nRecommended: ${value}`;
+							}
+							prompt = [
+								"Review this interview question and its options.",
+								"Rewrite the question so it is easier to understand while preserving the original intent.",
+								"Review the options the same way you already would: keep good ones as-is, fix bad ones, add missing ones, and remove bad ones.",
+								"Return ONLY JSON in this format:",
+								'{"question":"Clearer question text","options":["Option A","Option B","Option C"]}',
+								"",
+								questionsData.title ? `Interview: ${questionsData.title}` : null,
+								questionsData.description ? `Interview context: ${questionsData.description}` : null,
+								`Question: ${question.question}`,
+								question.context ? `Question context: ${question.context}` : null,
+								recommended || null,
+								"",
+								"Current options:",
+								existingList,
+							].filter((line) => line !== null).join("\n");
+						} else {
+							prompt = [
+								"Generate 3 new, distinct options for this question.",
+								"Return ONLY a JSON array of short option strings. No explanation, no markdown.",
+								"",
+								`Question: ${question.question}`,
+								question.context ? `Context: ${question.context}` : null,
+								"",
+								"Existing options (do NOT repeat):",
+								existingList,
+								"",
+								'Format: ["Option A", "Option B", "Option C"]',
+							].filter((line) => line !== null).join("\n");
+						}
+
+						if (mode === "review") {
+							let result: { question: string; options: string[] };
+							try {
+								result = await reviewQuestion(generateModel, prompt, generateSignal);
+							} catch (err) {
+								if (!fallbackGenerateModel || generateSignal.aborted) {
+									throw err;
+								}
+								try {
+									result = await reviewQuestion(fallbackGenerateModel, prompt, generateSignal);
+								} catch (fallbackErr) {
+									const primaryMessage = err instanceof Error ? err.message : String(err);
+									const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+									throw new Error(`${primaryMessage}. Fallback failed: ${fallbackMessage}`);
+								}
+							}
+
+							return result;
+						}
+
+						let options: string[];
+						try {
+							options = await generateOptions(generateModel, prompt, generateSignal);
+						} catch (err) {
+							if (!fallbackGenerateModel || generateSignal.aborted) {
+								throw err;
+							}
+							try {
+								options = await generateOptions(fallbackGenerateModel, prompt, generateSignal);
+							} catch (fallbackErr) {
+								const primaryMessage = err instanceof Error ? err.message : String(err);
+								const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+								throw new Error(`${primaryMessage}. Fallback failed: ${fallbackMessage}`);
+							}
+						}
+
+						return { options };
+					};
+				}
+
 				startInterviewServer(
 					{
 						questions: questionsData,
@@ -482,6 +829,7 @@ export default function (pi: ExtensionAPI) {
 						snapshotDir,
 						autoSaveOnSubmit: settings.autoSaveOnSubmit ?? true,
 						savedAnswers: questionsData.savedAnswers,
+						canGenerate: generateModel !== null,
 					},
 					{
 						onSubmit: (responses) => finish("completed", responses),
@@ -489,6 +837,7 @@ export default function (pi: ExtensionAPI) {
 							reason === "timeout"
 								? finish("timeout", partialResponses ?? [])
 								: finish("cancelled", partialResponses ?? [], reason),
+						onGenerate,
 					}
 				)
 					.then(async (handle) => {
